@@ -85,18 +85,17 @@ async function startDownload() {
   let response;
 
   if (fileType === 'file') {
-    // Try video stream first
-    showProgress('Checking for video stream…', 20);
+    // Try video stream first (parallel 6-thread download)
+    showProgress('Checking for video stream…', 10);
     response = await chrome.runtime.sendMessage({ action: 'downloadVideo', fileId, tabId: currentTab.id });
 
     if (response?.ok) {
-      hideProgress();
-      showSuccess('Video download started! Check the browser download bar.');
-      setWorking(false);
+      // Video is downloading in-page with progress — poll it
+      pollInPage('download');
       return;
     }
 
-    // Not a video — fall back to direct file download
+    // Not a video — fall back to direct file download via chrome.downloads
     showProgress('Resolving download URL…', 40);
     response = await chrome.runtime.sendMessage({ action: 'downloadFile', fileId, fileType, tabId: currentTab.id });
   } else {
@@ -112,8 +111,8 @@ async function startDownload() {
     return;
   }
 
-  // chrome.downloads handles the rest — show success immediately
-  showSuccess('Download started! Check the browser download bar at the bottom.');
+  // chrome.downloads handles the rest natively
+  showSuccess('Download started! Check the browser download bar.');
   setWorking(false);
 }
 
@@ -132,14 +131,19 @@ async function startPDFCapture() {
     return;
   }
 
-  // Poll the in-page pdf_capture.js status
+  pollInPage('pdf');
+}
+
+// ── In-page progress polling (video parallel download + PDF capture) ──────────
+function pollInPage(mode) {
   clearInterval(polling);
   polling = setInterval(async () => {
-    const result = await chrome.runtime.sendMessage({ action: 'pollPDF', tabId: currentTab.id }).catch(() => null);
+    const action = mode === 'pdf' ? 'pollPDF' : 'pollDownload';
+    const result = await chrome.runtime.sendMessage({ action, tabId: currentTab.id }).catch(() => null);
     const st     = result?.status;
     if (!st) return;
 
-    showProgress(st.message || 'Processing…', st.progress || 0);
+    if (st.message) showProgress(st.message, st.progress || 0);
 
     if (st.error) {
       clearInterval(polling);
@@ -149,7 +153,7 @@ async function startPDFCapture() {
     } else if (st.done) {
       clearInterval(polling);
       hideProgress();
-      showSuccess('PDF saved! Check your Downloads folder.');
+      showSuccess(st.filename ? `Saved: ${st.filename}` : (mode === 'pdf' ? 'PDF saved! Check your Downloads folder.' : 'Download complete!'));
       setWorking(false);
     }
   }, 700);
