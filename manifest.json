@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "DriveLoad",
+  "version": "2.0.0",
+  "description": "Download view-only Google Drive videos, PDFs, Docs, and files at original quality.",
+  "permissions": ["cookies", "downloads", "activeTab", "scripting", "tabs", "storage"],
+  "host_permissions": [
+    "https://drive.google.com/*",
+    "https://*.google.com/*",
+    "https://docs.google.com/*",
+    "https://drive.usercontent.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16":  "icons/icon16.png",
+      "48":  "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16":  "icons/icon16.png",
+    "48":  "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["vendor/jspdf.min.js", "pdf_capture.js"],
+      "matches": ["https://drive.google.com/*", "https://docs.google.com/*"]
+    }
+  ]
+}

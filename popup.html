@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <title>DriveLoad</title>
+  <link rel="stylesheet" href="styles.css"/>
+</head>
+<body>
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-left">
+      <div class="logo-mark">D</div>
+      <span class="logo-text">DriveLoad</span>
+    </div>
+    <span class="version">v2.0</span>
+  </div>
+
+  <!-- Not on Google Drive -->
+  <div id="view-none" class="view hidden">
+    <div class="empty-icon">📂</div>
+    <p class="empty-title">Open a Google Drive file</p>
+    <p class="empty-sub">Navigate to a Google Drive video, PDF, Doc, or file — then click this extension.</p>
+    <a href="https://drive.google.com" target="_blank" class="btn btn-muted">Open Google Drive →</a>
+  </div>
+
+  <!-- Main download view -->
+  <div id="view-main" class="view hidden">
+
+    <!-- File info pill -->
+    <div class="file-pill" id="file-pill">
+      <span class="file-icon" id="file-icon">📄</span>
+      <div class="file-info">
+        <div class="file-name" id="file-name">Detecting…</div>
+        <div class="file-type" id="file-type"></div>
+      </div>
+    </div>
+
+    <!-- Download buttons -->
+    <div id="btn-group">
+      <button class="btn btn-primary btn-lg" id="btn-download" onclick="startDownload()">
+        <span id="btn-label">⬇ Download File</span>
+      </button>
+      <button class="btn btn-secondary btn-lg hidden" id="btn-pdf-capture" onclick="startPDFCapture()">
+        📄 Download PDF via Viewer
+      </button>
+    </div>
+
+    <!-- Progress -->
+    <div id="progress-section" class="hidden">
+      <div class="progress-track">
+        <div id="progress-fill" class="progress-fill" style="width:0%"></div>
+      </div>
+      <div id="progress-label" class="progress-label">Starting…</div>
+    </div>
+
+    <!-- Result messages -->
+    <div id="success-card" class="success-card hidden">
+      <span class="result-icon">✓</span>
+      <div>
+        <div class="result-title">Download complete!</div>
+        <div class="result-sub" id="success-sub">Check your Downloads folder.</div>
+      </div>
+    </div>
+    <div id="error-card" class="error-card hidden">
+      <span class="result-icon">✕</span>
+      <div>
+        <div class="result-title">Download failed</div>
+        <div class="result-sub" id="error-sub"></div>
+      </div>
+    </div>
+
+    <!-- Hint about PDF viewer fallback -->
+    <div id="pdf-hint" class="hint hidden">
+      If the download above fails (owner disabled downloads), use <strong>Download PDF via Viewer</strong> — it captures directly from the rendered pages.
+    </div>
+
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
