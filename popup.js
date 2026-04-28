@@ -1,4 +1,4 @@
-// DriveLoad Popup
+// DriveLoad Popup — clean reliable version
 
 let currentTab = null;
 let fileId     = null;
@@ -31,10 +31,9 @@ document.getElementById('btn-pdf-capture').addEventListener('click', startPDFCap
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) { show(viewNone); return; }
   currentTab = tab;
-  const url  = tab.url || '';
 
-  fileId   = extractFileId(url);
-  fileType = detectFileType(url);
+  fileId   = extractFileId(tab.url || '');
+  fileType = detectFileType(tab.url || '');
 
   if (!fileId || !fileType) { show(viewNone); return; }
 
@@ -46,12 +45,11 @@ document.getElementById('btn-pdf-capture').addEventListener('click', startPDFCap
 
   if (fileType === 'file') { show(btnPDFCapture); show(pdfHint); }
 
-  const rawTitle = (tab.title || '')
-    .replace(/\s*-\s*Google\s*(Drive|Docs|Sheets|Slides|Forms).*$/i, '').trim();
-  fileName.textContent = rawTitle || fileId;
+  fileName.textContent = (tab.title || '')
+    .replace(/\s*-\s*Google\s*(Drive|Docs|Sheets|Slides|Forms).*$/i, '').trim() || fileId;
 })();
 
-// ── URL helpers ───────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function extractFileId(url) {
   const m = url.match(/\/(?:file|document|spreadsheets|presentation|forms)\/d\/([a-zA-Z0-9_-]+)/);
   if (m) return m[1];
@@ -68,12 +66,12 @@ function detectFileType(url) {
 }
 
 function typeLabel(type) {
-  return {
+  return ({
     file:  { icon: '📁', label: 'Google Drive File (video / PDF / image)', btnText: '⬇ Download File' },
     doc:   { icon: '📝', label: 'Google Doc — downloads as .docx',         btnText: '⬇ Download as Word (.docx)' },
     sheet: { icon: '📊', label: 'Google Sheet — downloads as .xlsx',       btnText: '⬇ Download as Excel (.xlsx)' },
     slide: { icon: '📽', label: 'Google Slides — downloads as .pptx',     btnText: '⬇ Download as PowerPoint (.pptx)' },
-  }[type] || { icon: '📁', label: 'Google Drive File', btnText: '⬇ Download File' };
+  })[type] || { icon: '📁', label: 'Google Drive File', btnText: '⬇ Download File' };
 }
 
 // ── Primary download ──────────────────────────────────────────────────────────
@@ -82,59 +80,45 @@ async function startDownload() {
   setWorking(true);
 
   if (fileType === 'file') {
-    showProgress('Checking for video stream…', 10);
+    // Try video stream first
+    showProgress('Checking for video stream…', 15);
     const vRes = await chrome.runtime.sendMessage({ action: 'downloadVideo', fileId, tabId: currentTab.id });
+
     if (vRes?.ok) {
-      pollFileDownload(); // video uses same parallel SW download + progress polling
+      hideProgress();
+      showSuccess(`Video download started!\nCheck the browser download bar.`);
+      setWorking(false);
       return;
     }
+
+    // Not a video — download as generic file
+    showProgress('Resolving download URL…', 40);
+  } else {
+    showProgress('Resolving download URL…', 40);
   }
 
-  showProgress('Resolving download URL…', 20);
   const res = await chrome.runtime.sendMessage({ action: 'downloadFile', fileId, fileType, tabId: currentTab.id });
 
+  hideProgress();
+
   if (!res?.ok) {
-    hideProgress();
     showError(res?.error || 'Download failed. Make sure you are logged into Google and on a Drive file page.');
     setWorking(false);
     return;
   }
 
-  // SW handles parallel download — poll __dl_status for progress
-  pollFileDownload();
+  showSuccess('Download started!\nCheck the browser download bar.');
+  setWorking(false);
 }
 
-// ── Poll in-page download progress ───────────────────────────────────────────
-function pollFileDownload() {
-  clearInterval(polling);
-  polling = setInterval(async () => {
-    const result = await chrome.runtime.sendMessage({ action: 'pollDownload', tabId: currentTab.id }).catch(() => null);
-    const st     = result?.status;
-    if (!st) return;
-
-    if (st.message) showProgress(st.message, st.progress || 0);
-
-    if (st.error) {
-      clearInterval(polling);
-      hideProgress();
-      showError(st.error);
-      setWorking(false);
-    } else if (st.done) {
-      clearInterval(polling);
-      hideProgress();
-      showSuccess(st.filename ? `Saved: ${st.filename}` : 'Download complete!');
-      setWorking(false);
-    }
-  }, 500);
-}
-
-// ── PDF canvas capture (fallback for locked PDFs) ─────────────────────────────
+// ── PDF canvas capture ────────────────────────────────────────────────────────
 async function startPDFCapture() {
   resetResult();
   setWorking(true);
   showProgress('Injecting PDF capture…', 5);
 
   const res = await chrome.runtime.sendMessage({ action: 'injectPDF', tabId: currentTab.id });
+
   if (!res?.ok) {
     hideProgress();
     showError(res?.error || 'Could not inject PDF capture. Make sure the PDF is open in Google Drive viewer.');
@@ -142,19 +126,13 @@ async function startPDFCapture() {
     return;
   }
 
-  pollInPage('pdf');
-}
-
-// ── Generic in-page poller (PDF capture) ─────────────────────────────────────
-function pollInPage(mode) {
   clearInterval(polling);
   polling = setInterval(async () => {
-    const action = mode === 'pdf' ? 'pollPDF' : 'pollDownload';
-    const result = await chrome.runtime.sendMessage({ action, tabId: currentTab.id }).catch(() => null);
-    const st     = result?.status;
+    const r  = await chrome.runtime.sendMessage({ action: 'pollPDF', tabId: currentTab.id }).catch(() => null);
+    const st = r?.status;
     if (!st) return;
 
-    if (st.message) showProgress(st.message, st.progress || 0);
+    showProgress(st.message || 'Processing…', st.progress || 0);
 
     if (st.error) {
       clearInterval(polling);
@@ -164,7 +142,7 @@ function pollInPage(mode) {
     } else if (st.done) {
       clearInterval(polling);
       hideProgress();
-      showSuccess(st.filename ? `Saved: ${st.filename}` : 'PDF saved! Check your Downloads folder.');
+      showSuccess('PDF saved! Check your Downloads folder.');
       setWorking(false);
     }
   }, 700);
@@ -173,11 +151,7 @@ function pollInPage(mode) {
 // ── UI helpers ────────────────────────────────────────────────────────────────
 function show(el) { el.classList.remove('hidden'); }
 function hide(el) { el.classList.add('hidden'); }
-
-function setWorking(on) {
-  btnDownload.disabled   = on;
-  btnPDFCapture.disabled = on;
-}
+function setWorking(on) { btnDownload.disabled = on; btnPDFCapture.disabled = on; }
 
 function showProgress(msg, pct) {
   show(progressSec);
@@ -186,18 +160,6 @@ function showProgress(msg, pct) {
 }
 function hideProgress() { hide(progressSec); }
 
-function showSuccess(msg) {
-  hide(errorCard);
-  successSub.textContent = msg;
-  show(successCard);
-}
-function showError(msg) {
-  hide(successCard);
-  errorSub.textContent = msg;
-  show(errorCard);
-}
-function resetResult() {
-  hide(successCard);
-  hide(errorCard);
-  hideProgress();
-}
+function showSuccess(msg) { hide(errorCard); successSub.textContent = msg; show(successCard); }
+function showError(msg)   { hide(successCard); errorSub.textContent = msg; show(errorCard); }
+function resetResult()    { hide(successCard); hide(errorCard); hideProgress(); }
