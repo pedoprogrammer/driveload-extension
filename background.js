@@ -7,11 +7,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === 'pollPDF')       { pollPDF(msg.tabId).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message })); return true; }
 });
 
-// ── 1. Video: get_video_info → signed URL → chrome.downloads ──────────────────
+// ── 1. Video ───────────────────────────────────────────────────────────────────
 async function handleVideo(fileId, tabId) {
   const results = await chrome.scripting.executeScript({
-    target: { tabId },
-    world:  'MAIN',
+    target: { tabId }, world: 'MAIN',
     func: async (fid) => {
       try {
         const r    = await fetch(
@@ -32,7 +31,7 @@ async function handleVideo(fileId, tabId) {
   });
 
   const info = results[0]?.result;
-  if (!info?.videoUrl) return { ok: false, error: 'No video stream found. Make sure you are logged into Google.' };
+  if (!info?.videoUrl) return { ok: false, error: 'No video stream found.' };
 
   const filename = (info.title || fileId).replace(/[\\/*?:"<>|]/g, '_') + '.mp4';
   return new Promise(resolve => {
@@ -43,13 +42,11 @@ async function handleVideo(fileId, tabId) {
   });
 }
 
-// ── 2. Files / Docs / PDFs ────────────────────────────────────────────────────
-// FIXED approach:
-//   Step 1 — inject a FAST script that only resolves the real download URL
-//             (handles Google's large-file confirmation page).
-//             This takes < 2 seconds — service worker is NOT blocked.
-//   Step 2 — pass the URL to chrome.downloads.
-//             Chrome uses its own cookie jar → no CORS, no blob, no memory issues.
+// ── 2. Files / PDFs / Docs ────────────────────────────────────────────────────
+// Key fix: use redirect:'manual' so the injected fetch never hits a cross-origin
+// redirect. If Google redirects to drive.usercontent.google.com we return the
+// original URL and let chrome.downloads follow it — it uses Chrome's own cookie
+// jar with no CORS restrictions.
 async function handleFile(fileId, fileType, tabId) {
   let baseUrl, defaultExt;
   if      (fileType === 'doc')   { baseUrl = `https://docs.google.com/document/d/${fileId}/export/docx`;       defaultExt = 'docx'; }
@@ -57,38 +54,41 @@ async function handleFile(fileId, fileType, tabId) {
   else if (fileType === 'slide') { baseUrl = `https://docs.google.com/presentation/d/${fileId}/export/pptx`;  defaultExt = 'pptx'; }
   else                           { baseUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;       defaultExt = '';     }
 
-  // Inject a fast URL-resolver — does NOT download the file itself
   const results = await chrome.scripting.executeScript({
-    target: { tabId },
-    world:  'MAIN',
+    target: { tabId }, world: 'MAIN',
     func: async (url) => {
-      function parseFn(headers) {
-        const cd = headers.get('content-disposition') || '';
-        const m  = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)/i);
-        return m ? decodeURIComponent(m[1].trim().replace(/["']/g, '')) : null;
-      }
       try {
-        const r  = await fetch(url, { credentials: 'include' });
-        const ct = r.headers.get('content-type') || '';
+        // redirect:'manual' → we never follow a cross-origin redirect ourselves,
+        // so we never hit a CORS error on drive.usercontent.google.com
+        const r  = await fetch(url, { credentials: 'include', redirect: 'manual' });
 
-        if (!ct.includes('text/html')) {
-          // Direct binary — URL is ready
-          return { downloadUrl: url, filename: parseFn(r.headers) };
+        // opaqueredirect means Google sent a 302/301/307 to the CDN.
+        // Return the original URL — chrome.downloads will follow the redirect
+        // with Chrome's cookies (no CORS restriction on chrome.downloads).
+        if (r.type === 'opaqueredirect' || r.status === 0) {
+          return { downloadUrl: url };
         }
 
-        // Google returned an HTML confirmation page (large file antivirus warning)
+        const ct = r.headers.get('content-type') || '';
+
+        // Direct binary (unlikely without redirect, but handle it)
+        if (!ct.includes('text/html')) {
+          const cd  = r.headers.get('content-disposition') || '';
+          const fnm = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)/i);
+          return { downloadUrl: url, filename: fnm ? decodeURIComponent(fnm[1].trim().replace(/["']/g, '')) : null };
+        }
+
+        // Google returned an HTML confirmation page (large-file antivirus warning)
         const html   = await r.text();
         const cMatch = html.match(/confirm=([^&"'>\s]+)/);
         const uMatch = html.match(/uuid=([^&"'>\s]+)/);
 
-        if (!cMatch) return { error: 'Download blocked — the file owner may have disabled downloads.' };
+        if (!cMatch) {
+          return { error: 'Download blocked. The file owner may have disabled downloads, or you are not logged into Google.' };
+        }
 
         const confirmedUrl = `${url}&confirm=${cMatch[1]}${uMatch ? '&uuid=' + uMatch[1] : ''}`;
-        const r2           = await fetch(confirmedUrl, { credentials: 'include' });
-        const filename     = parseFn(r2.headers);
-
-        // Return the final URL — chrome.downloads will follow any remaining redirect
-        return { downloadUrl: confirmedUrl, filename };
+        return { downloadUrl: confirmedUrl };
       } catch (e) {
         return { error: e.message };
       }
@@ -97,22 +97,22 @@ async function handleFile(fileId, fileType, tabId) {
   });
 
   const info = results[0]?.result;
-  if (!info)             return { ok: false, error: 'Script injection failed. Make sure you are on a Google Drive page.' };
+  if (!info)             return { ok: false, error: 'Could not run script. Make sure you are on a Google Drive page.' };
   if (info.error)        return { ok: false, error: info.error };
   if (!info.downloadUrl) return { ok: false, error: 'Could not resolve download URL.' };
 
-  // chrome.downloads sends the request with Chrome's own cookies — works for all Google domains
+  // chrome.downloads uses Chrome's cookie jar — handles the CDN redirect with cookies
   return new Promise(resolve => {
     const opts = { url: info.downloadUrl, saveAs: false };
     if (info.filename) opts.filename = info.filename.replace(/[\\/*?:"<>|]/g, '_');
     chrome.downloads.download(opts, id => {
       if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
-      else resolve({ ok: true, filename: info.filename });
+      else resolve({ ok: true });
     });
   });
 }
 
-// ── 3. PDF canvas capture (fallback for locked PDFs) ─────────────────────────
+// ── 3. PDF canvas capture ─────────────────────────────────────────────────────
 async function handlePDFCapture(tabId) {
   await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', files: ['vendor/jspdf.min.js'] });
   await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: () => { window.__driveload_status = null; } });
@@ -120,7 +120,7 @@ async function handlePDFCapture(tabId) {
   return { ok: true };
 }
 
-// ── 4. Poll PDF capture progress ──────────────────────────────────────────────
+// ── 4. Poll PDF progress ──────────────────────────────────────────────────────
 async function pollPDF(tabId) {
   const results = await chrome.scripting.executeScript({
     target: { tabId }, world: 'MAIN',
