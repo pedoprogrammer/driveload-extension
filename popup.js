@@ -22,6 +22,10 @@ const errorCard     = document.getElementById('error-card');
 const errorSub      = document.getElementById('error-sub');
 const pdfHint       = document.getElementById('pdf-hint');
 
+// ── Button listeners (no inline onclick — blocked by MV3 CSP) ────────────────
+document.getElementById('btn-download').addEventListener('click', startDownload);
+document.getElementById('btn-pdf-capture').addEventListener('click', startPDFCapture);
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 (async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
