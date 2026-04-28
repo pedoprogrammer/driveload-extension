@@ -8,7 +8,8 @@
     "https://drive.google.com/*",
     "https://*.google.com/*",
     "https://docs.google.com/*",
-    "https://drive.usercontent.google.com/*"
+    "https://drive.usercontent.google.com/*",
+    "https://*.googlevideo.com/*"
   ],
   "background": {
     "service_worker": "background.js"

@@ -3,8 +3,8 @@
 // automatically for any URL in host_permissions.
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.action === 'downloadVideo') { handleVideo(msg.fileId, msg.tabId).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message })); return true; }
-  if (msg.action === 'downloadFile')  { handleFile(msg, sendResponse); return true; }
+  if (msg.action === 'downloadVideo') { handleVideo(msg, sendResponse); return true; }
+  if (msg.action === 'downloadFile')  { handleFile(msg, sendResponse);  return true; }
   if (msg.action === 'injectPDF')     { handlePDFCapture(msg.tabId).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message })); return true; }
   if (msg.action === 'pollPDF')       { pollPDF(msg.tabId).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message })); return true; }
   if (msg.action === 'pollDownload')  { pollDownload(msg.tabId).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message })); return true; }
@@ -24,45 +24,94 @@ async function setPageStatus(tabId, msg, pct, err) {
   }).catch(() => {});
 }
 
-// ── 1. Video ───────────────────────────────────────────────────────────────────
-async function handleVideo(fileId, tabId) {
-  const results = await chrome.scripting.executeScript({
-    target: { tabId }, world: 'MAIN',
-    func: async (fid) => {
-      try {
-        const r    = await fetch(`https://drive.google.com/u/0/get_video_info?docid=${fid}&drive_originator_app=303`, { credentials: 'include' });
-        const text = await r.text();
-        let title = null;
-        for (const part of text.split('&')) {
-          if (part.startsWith('title=')) { title = decodeURIComponent(part.slice(6)).replace(/\+/g, ' '); break; }
-        }
-        const urlMap = {};
-        for (const part of text.split('&')) {
-          if (part.includes('videoplayback')) {
-            const url = decodeURIComponent(part.replace(/\+/g, ' ')).split('|').pop();
-            const m   = url.match(/[?&]itag=(\d+)/);
-            urlMap[m ? parseInt(m[1]) : 999] = url;
+// ── 1. Video — service worker 8-thread parallel download ──────────────────────
+// googlevideo.com is in host_permissions → service worker bypasses CORS.
+// Video URLs have auth in URL params → no cookies needed (credentials:'omit').
+async function handleVideo({ fileId, tabId }, sendResponse) {
+  // Step 1: get best-quality streaming URL from page (needs page cookies)
+  let info;
+  try {
+    const res = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN',
+      func: async (fid) => {
+        try {
+          const r    = await fetch(`https://drive.google.com/u/0/get_video_info?docid=${fid}&drive_originator_app=303`, { credentials: 'include' });
+          const text = await r.text();
+          let title = null;
+          for (const part of text.split('&')) {
+            if (part.startsWith('title=')) { title = decodeURIComponent(part.slice(6)).replace(/\+/g, ' '); break; }
           }
-        }
-        let videoUrl = null;
-        for (const itag of [37, 22, 59, 18]) { if (urlMap[itag]) { videoUrl = urlMap[itag]; break; } }
-        if (!videoUrl) videoUrl = Object.values(urlMap)[0] || null;
-        return { videoUrl, title };
-      } catch (e) { return { error: e.message }; }
-    },
-    args: [fileId]
-  });
+          const urlMap = {};
+          for (const part of text.split('&')) {
+            if (part.includes('videoplayback')) {
+              const url = decodeURIComponent(part.replace(/\+/g, ' ')).split('|').pop();
+              const m   = url.match(/[?&]itag=(\d+)/);
+              urlMap[m ? parseInt(m[1]) : 999] = url;
+            }
+          }
+          let videoUrl = null;
+          for (const itag of [37, 22, 59, 18]) { if (urlMap[itag]) { videoUrl = urlMap[itag]; break; } }
+          if (!videoUrl) videoUrl = Object.values(urlMap)[0] || null;
+          return { videoUrl, title };
+        } catch (e) { return { error: e.message }; }
+      },
+      args: [fileId]
+    });
+    info = res[0]?.result;
+  } catch (e) {
+    sendResponse({ ok: false, error: e.message });
+    return;
+  }
 
-  const info = results[0]?.result;
-  if (!info?.videoUrl) return { ok: false, error: 'No video stream found. Make sure you are logged into Google.' };
+  if (!info?.videoUrl) { sendResponse({ ok: false, error: 'No video stream found. Make sure you are logged into Google.' }); return; }
 
   const filename = (info.title || fileId).replace(/[\\/*?:"<>|]/g, '_') + '.mp4';
-  return new Promise(resolve => {
-    chrome.downloads.download({ url: info.videoUrl, filename }, id => {
-      if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
-      else resolve({ ok: true, filename });
-    });
+
+  // Step 2: init status and tell popup to start polling
+  await chrome.scripting.executeScript({
+    target: { tabId }, world: 'MAIN',
+    func: () => { window.__dl_status = { running: true, progress: 0, message: 'Starting…', error: null, done: false }; }
   });
+  sendResponse({ ok: true });
+
+  // Step 3: parallel download in service worker (googlevideo.com in host_permissions)
+  try {
+    await setPageStatus(tabId, 'Getting video size…', 3);
+    const headR = await fetch(info.videoUrl, { credentials: 'omit', method: 'HEAD' });
+    const size  = parseInt(headR.headers.get('content-length') || '0');
+
+    if (!size) {
+      await setPageStatus(tabId, 'Downloading…', 5);
+      const r   = await fetch(info.videoUrl, { credentials: 'omit' });
+      const buf = await r.arrayBuffer();
+      await triggerDownload(tabId, buf, filename);
+      return;
+    }
+
+    const THREADS   = 8;
+    const chunkSize = Math.ceil(size / THREADS);
+    const chunks    = new Array(THREADS);
+    let received    = 0;
+
+    await setPageStatus(tabId, 'Downloading… 0%', 5);
+    await Promise.all(Array.from({ length: THREADS }, async (_, i) => {
+      const start = i * chunkSize;
+      const end   = Math.min(start + chunkSize - 1, size - 1);
+      const r     = await fetch(info.videoUrl, { credentials: 'omit', headers: { Range: `bytes=${start}-${end}` } });
+      const buf   = await r.arrayBuffer();
+      chunks[i]   = buf;
+      received   += buf.byteLength;
+      await setPageStatus(tabId, `Downloading… ${Math.round(received / size * 100)}%`, 5 + (received / size * 90));
+    }));
+
+    await setPageStatus(tabId, 'Saving…', 97);
+    const combined = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { combined.set(new Uint8Array(chunk), offset); offset += chunk.byteLength; }
+    await triggerDownload(tabId, combined.buffer, filename);
+  } catch (e) {
+    await setPageStatus(tabId, undefined, undefined, 'Video download failed: ' + e.message);
+  }
 }
 
 // ── 2. Files / Docs / PDFs — 8-thread parallel download in service worker ─────

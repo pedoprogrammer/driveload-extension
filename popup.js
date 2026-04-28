@@ -85,9 +85,7 @@ async function startDownload() {
     showProgress('Checking for video stream…', 10);
     const vRes = await chrome.runtime.sendMessage({ action: 'downloadVideo', fileId, tabId: currentTab.id });
     if (vRes?.ok) {
-      hideProgress();
-      showSuccess('Video download started! Check the browser download bar.');
-      setWorking(false);
+      pollFileDownload(); // video uses same parallel SW download + progress polling
       return;
     }
   }
