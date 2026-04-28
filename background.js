@@ -8,11 +8,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === 'pollDownload')  { pollDownload(msg.tabId).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message })); return true; }
 });
 
-// ── 1. Video — best quality + 6-thread parallel download ─────────────────────
-// Video URLs from get_video_info (googlevideo.com) support range requests and
-// have auth embedded in the URL — no cookies needed, no CORS issues.
+// ── 1. Video — best quality via chrome.downloads (no CORS restriction) ────────
+// fetch() to googlevideo.com from the page fails with CORS.
+// chrome.downloads bypasses CORS and uses Chrome's own network stack.
 async function handleVideo(fileId, tabId) {
-  // Step 1: resolve best quality URL from get_video_info
   const results = await chrome.scripting.executeScript({
     target: { tabId }, world: 'MAIN',
     func: async (fid) => {
@@ -23,7 +22,6 @@ async function handleVideo(fileId, tabId) {
         );
         const text = await r.text();
 
-        // Extract title
         let title = null;
         for (const part of text.split('&')) {
           if (part.startsWith('title=')) { title = decodeURIComponent(part.slice(6)).replace(/\+/g, ' '); break; }
@@ -35,12 +33,11 @@ async function handleVideo(fileId, tabId) {
           if (part.includes('videoplayback')) {
             const url  = decodeURIComponent(part.replace(/\+/g, ' ')).split('|').pop();
             const m    = url.match(/[?&]itag=(\d+)/);
-            const itag = m ? parseInt(m[1]) : 999;
-            urlMap[itag] = url;
+            urlMap[m ? parseInt(m[1]) : 999] = url;
           }
         }
 
-        // Pick highest quality: 37=1080p > 22=720p > 59=480p > 18=360p > any
+        // Best quality: 37=1080p > 22=720p > 59=480p > 18=360p > any
         let videoUrl = null;
         for (const itag of [37, 22, 59, 18]) {
           if (urlMap[itag]) { videoUrl = urlMap[itag]; break; }
@@ -58,75 +55,13 @@ async function handleVideo(fileId, tabId) {
 
   const filename = (info.title || fileId).replace(/[\\/*?:"<>|]/g, '_') + '.mp4';
 
-  // Step 2: inject 6-thread parallel downloader into the page
-  // googlevideo.com has CORS open (needed for embedded players), range requests supported.
-  await chrome.scripting.executeScript({
-    target: { tabId }, world: 'MAIN',
-    func: (videoUrl, filename) => {
-      window.__dl_status = { running: true, progress: 0, message: 'Starting…', error: null, done: false };
-      const setS = (msg, pct) => { window.__dl_status.message = msg; window.__dl_status.progress = Math.round(pct); };
-
-      void (async () => {
-        try {
-          setS('Checking file size…', 1);
-
-          // HEAD to get size (no credentials — auth is in URL params)
-          let size = 0;
-          try {
-            const h = await fetch(videoUrl, { method: 'HEAD', credentials: 'omit' });
-            size = parseInt(h.headers.get('content-length') || '0');
-          } catch (_) { size = 0; }
-
-          if (!size) {
-            // No size info — single connection fallback
-            setS('Downloading…', 5);
-            const r    = await fetch(videoUrl, { credentials: 'omit' });
-            const blob = await r.blob();
-            setS('Saving…', 98);
-            const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: filename });
-            document.body.appendChild(a); a.click(); document.body.removeChild(a);
-            window.__dl_status = { done: true, progress: 100, message: `Saved: ${filename}` };
-            return;
-          }
-
-          // 6-thread parallel chunk download (mirrors DriveLoad server logic)
-          const THREADS   = 6;
-          const chunkSize = Math.ceil(size / THREADS);
-          setS(`Downloading with ${THREADS} parallel connections…`, 2);
-
-          const chunks   = new Array(THREADS);
-          let received   = 0;
-
-          await Promise.all(Array.from({ length: THREADS }, async (_, i) => {
-            const start = i * chunkSize;
-            const end   = Math.min(start + chunkSize - 1, size - 1);
-            const r     = await fetch(videoUrl, {
-              credentials: 'omit',
-              headers: { Range: `bytes=${start}-${end}` }
-            });
-            const buf   = await r.arrayBuffer();
-            chunks[i]   = buf;
-            received   += buf.byteLength;
-            setS(`Downloading… ${Math.round(received / size * 100)}%`, received / size * 95);
-          }));
-
-          setS('Saving file…', 97);
-          const blob = new Blob(chunks, { type: 'video/mp4' });
-          const burl = URL.createObjectURL(blob);
-          const a    = Object.assign(document.createElement('a'), { href: burl, download: filename });
-          document.body.appendChild(a); a.click(); document.body.removeChild(a);
-          setTimeout(() => URL.revokeObjectURL(burl), 120_000);
-
-          window.__dl_status = { done: true, progress: 100, message: `Saved: ${filename}`, filename };
-        } catch (e) {
-          window.__dl_status = { done: false, running: false, error: e.message };
-        }
-      })();
-    },
-    args: [info.videoUrl, filename]
+  // chrome.downloads has no CORS restrictions and video URLs have auth in params
+  return new Promise(resolve => {
+    chrome.downloads.download({ url: info.videoUrl, filename }, id => {
+      if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
+      else resolve({ ok: true, filename });
+    });
   });
-
-  return { ok: true, mode: 'download', filename };
 }
 
 // ── 2. Files / Docs / PDFs ────────────────────────────────────────────────────

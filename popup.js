@@ -90,8 +90,9 @@ async function startDownload() {
     response = await chrome.runtime.sendMessage({ action: 'downloadVideo', fileId, tabId: currentTab.id });
 
     if (response?.ok) {
-      // Video is downloading in-page with progress — poll it
-      pollInPage('download');
+      hideProgress();
+      showSuccess('Video download started! Check the browser download bar.');
+      setWorking(false);
       return;
     }
 
