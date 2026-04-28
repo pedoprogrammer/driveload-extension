@@ -1,9 +1,11 @@
 // DriveLoad Popup
 
-let currentTab = null;
-let fileId     = null;
-let fileType   = null;
-let polling    = null;
+let currentTab      = null;
+let fileId          = null;
+let fileType        = null;
+let polling         = null;
+let confirmedUrl    = null;
+let downloadFilename= null;
 
 const viewNone      = document.getElementById('view-none');
 const viewMain      = document.getElementById('view-main');
@@ -22,7 +24,7 @@ const errorCard     = document.getElementById('error-card');
 const errorSub      = document.getElementById('error-sub');
 const pdfHint       = document.getElementById('pdf-hint');
 
-// ── Button listeners (no inline onclick — blocked by MV3 CSP) ────────────────
+// ── Button listeners ──────────────────────────────────────────────────────────
 document.getElementById('btn-download').addEventListener('click', startDownload);
 document.getElementById('btn-pdf-capture').addEventListener('click', startPDFCapture);
 
@@ -80,54 +82,87 @@ function typeLabel(type) {
 async function startDownload() {
   resetResult();
   setWorking(true);
-  showProgress('Connecting to Google Drive…', 10);
-
-  let response;
 
   if (fileType === 'file') {
-    // Try video stream first (parallel 6-thread download)
     showProgress('Checking for video stream…', 10);
-    response = await chrome.runtime.sendMessage({ action: 'downloadVideo', fileId, tabId: currentTab.id });
-
-    if (response?.ok) {
+    const vRes = await chrome.runtime.sendMessage({ action: 'downloadVideo', fileId, tabId: currentTab.id });
+    if (vRes?.ok) {
       hideProgress();
       showSuccess('Video download started! Check the browser download bar.');
       setWorking(false);
       return;
     }
-
-    // Not a video — fall back to direct file download via chrome.downloads
-    showProgress('Resolving download URL…', 40);
-    response = await chrome.runtime.sendMessage({ action: 'downloadFile', fileId, fileType, tabId: currentTab.id });
-  } else {
-    showProgress('Resolving download URL…', 40);
-    response = await chrome.runtime.sendMessage({ action: 'downloadFile', fileId, fileType, tabId: currentTab.id });
   }
 
-  hideProgress();
+  showProgress('Resolving download URL…', 20);
+  const res = await chrome.runtime.sendMessage({ action: 'downloadFile', fileId, fileType, tabId: currentTab.id });
 
-  if (!response?.ok) {
-    showError(response?.error || 'Download failed. Make sure you are logged into Google and on a Drive file page.');
+  if (!res?.ok) {
+    hideProgress();
+    showError(res?.error || 'Download failed. Make sure you are logged into Google and on a Drive file page.');
     setWorking(false);
     return;
   }
 
-  // chrome.downloads handles the rest natively
-  showSuccess('Download started! Check the browser download bar.');
-  setWorking(false);
+  // Save for potential fallback
+  confirmedUrl     = res.confirmedUrl;
+  downloadFilename = res.filename;
+
+  // Poll the in-page parallel downloader
+  pollFileDownload();
 }
 
-// ── PDF canvas capture (fallback for locked files) ────────────────────────────
+// ── Poll in-page download + handle chrome.downloads fallback ─────────────────
+function pollFileDownload() {
+  clearInterval(polling);
+  polling = setInterval(async () => {
+    const result = await chrome.runtime.sendMessage({ action: 'pollDownload', tabId: currentTab.id }).catch(() => null);
+    const st     = result?.status;
+    if (!st) return;
+
+    if (st.error === '__USE_SYSTEM_DL__') {
+      // Parallel CORS failed → fall back to chrome.downloads silently
+      clearInterval(polling);
+      showProgress('Using standard download…', 80);
+      const fb = await chrome.runtime.sendMessage({
+        action: 'systemDownload', url: confirmedUrl, filename: downloadFilename
+      }).catch(() => null);
+      hideProgress();
+      if (fb?.ok) showSuccess('Download started! Check the browser download bar.');
+      else         showError(fb?.error || 'Download failed.');
+      setWorking(false);
+      return;
+    }
+
+    if (st.error) {
+      clearInterval(polling);
+      hideProgress();
+      showError(st.error);
+      setWorking(false);
+      return;
+    }
+
+    if (st.message) showProgress(st.message, st.progress || 0);
+
+    if (st.done) {
+      clearInterval(polling);
+      hideProgress();
+      showSuccess(st.filename ? `Saved: ${st.filename}` : 'Download complete!');
+      setWorking(false);
+    }
+  }, 500);
+}
+
+// ── PDF canvas capture (fallback for locked PDFs) ─────────────────────────────
 async function startPDFCapture() {
   resetResult();
   setWorking(true);
   showProgress('Injecting PDF capture…', 5);
 
-  const response = await chrome.runtime.sendMessage({ action: 'injectPDF', tabId: currentTab.id });
-
-  if (!response?.ok) {
+  const res = await chrome.runtime.sendMessage({ action: 'injectPDF', tabId: currentTab.id });
+  if (!res?.ok) {
     hideProgress();
-    showError(response?.error || 'Could not inject PDF capture. Make sure the PDF is open in Google Drive viewer.');
+    showError(res?.error || 'Could not inject PDF capture. Make sure the PDF is open in Google Drive viewer.');
     setWorking(false);
     return;
   }
@@ -135,7 +170,7 @@ async function startPDFCapture() {
   pollInPage('pdf');
 }
 
-// ── In-page progress polling (video parallel download + PDF capture) ──────────
+// ── Generic in-page poller (PDF capture) ─────────────────────────────────────
 function pollInPage(mode) {
   clearInterval(polling);
   polling = setInterval(async () => {
@@ -154,7 +189,7 @@ function pollInPage(mode) {
     } else if (st.done) {
       clearInterval(polling);
       hideProgress();
-      showSuccess(st.filename ? `Saved: ${st.filename}` : (mode === 'pdf' ? 'PDF saved! Check your Downloads folder.' : 'Download complete!'));
+      showSuccess(st.filename ? `Saved: ${st.filename}` : 'PDF saved! Check your Downloads folder.');
       setWorking(false);
     }
   }, 700);

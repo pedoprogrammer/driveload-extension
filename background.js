@@ -1,16 +1,15 @@
 // DriveLoad Background Service Worker
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.action === 'downloadVideo') { handleVideo(msg.fileId, msg.tabId).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message })); return true; }
-  if (msg.action === 'downloadFile')  { handleFile(msg.fileId, msg.fileType, msg.tabId).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message })); return true; }
-  if (msg.action === 'injectPDF')     { handlePDFCapture(msg.tabId).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message })); return true; }
-  if (msg.action === 'pollPDF')       { pollPDF(msg.tabId).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message })); return true; }
-  if (msg.action === 'pollDownload')  { pollDownload(msg.tabId).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message })); return true; }
+  if (msg.action === 'downloadVideo')   { handleVideo(msg.fileId, msg.tabId).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message })); return true; }
+  if (msg.action === 'downloadFile')    { handleFile(msg.fileId, msg.fileType, msg.tabId).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message })); return true; }
+  if (msg.action === 'systemDownload')  { systemDownload(msg.url, msg.filename).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message })); return true; }
+  if (msg.action === 'injectPDF')       { handlePDFCapture(msg.tabId).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message })); return true; }
+  if (msg.action === 'pollPDF')         { pollPDF(msg.tabId).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message })); return true; }
+  if (msg.action === 'pollDownload')    { pollDownload(msg.tabId).then(sendResponse).catch(e => sendResponse({ ok: false, error: e.message })); return true; }
 });
 
-// ── 1. Video — best quality via chrome.downloads (no CORS restriction) ────────
-// fetch() to googlevideo.com from the page fails with CORS.
-// chrome.downloads bypasses CORS and uses Chrome's own network stack.
+// ── 1. Video ───────────────────────────────────────────────────────────────────
 async function handleVideo(fileId, tabId) {
   const results = await chrome.scripting.executeScript({
     target: { tabId }, world: 'MAIN',
@@ -21,13 +20,10 @@ async function handleVideo(fileId, tabId) {
           { credentials: 'include' }
         );
         const text = await r.text();
-
         let title = null;
         for (const part of text.split('&')) {
           if (part.startsWith('title=')) { title = decodeURIComponent(part.slice(6)).replace(/\+/g, ' '); break; }
         }
-
-        // Collect all videoplayback URLs keyed by itag
         const urlMap = {};
         for (const part of text.split('&')) {
           if (part.includes('videoplayback')) {
@@ -36,14 +32,9 @@ async function handleVideo(fileId, tabId) {
             urlMap[m ? parseInt(m[1]) : 999] = url;
           }
         }
-
-        // Best quality: 37=1080p > 22=720p > 59=480p > 18=360p > any
         let videoUrl = null;
-        for (const itag of [37, 22, 59, 18]) {
-          if (urlMap[itag]) { videoUrl = urlMap[itag]; break; }
-        }
+        for (const itag of [37, 22, 59, 18]) { if (urlMap[itag]) { videoUrl = urlMap[itag]; break; } }
         if (!videoUrl) videoUrl = Object.values(urlMap)[0] || null;
-
         return { videoUrl, title };
       } catch (e) { return { error: e.message }; }
     },
@@ -54,8 +45,6 @@ async function handleVideo(fileId, tabId) {
   if (!info?.videoUrl) return { ok: false, error: 'No video stream found. Make sure you are logged into Google.' };
 
   const filename = (info.title || fileId).replace(/[\\/*?:"<>|]/g, '_') + '.mp4';
-
-  // chrome.downloads has no CORS restrictions and video URLs have auth in params
   return new Promise(resolve => {
     chrome.downloads.download({ url: info.videoUrl, filename }, id => {
       if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
@@ -65,55 +54,127 @@ async function handleVideo(fileId, tabId) {
 }
 
 // ── 2. Files / Docs / PDFs ────────────────────────────────────────────────────
+// Step 1 — fast URL resolver (gets confirmation token, avoids CORS on redirect)
+// Step 2 — inject 8-thread parallel downloader into the page (fire-and-forget)
+//           drive.usercontent.google.com supports CORS for Google's own origins.
+//           If parallel fails → sets __dl_status.error = '__USE_SYSTEM_DL__'
+//           popup picks this up and calls systemDownload via chrome.downloads.
 async function handleFile(fileId, fileType, tabId) {
-  let baseUrl;
-  if      (fileType === 'doc')   baseUrl = `https://docs.google.com/document/d/${fileId}/export/docx`;
-  else if (fileType === 'sheet') baseUrl = `https://docs.google.com/spreadsheets/d/${fileId}/export/xlsx`;
-  else if (fileType === 'slide') baseUrl = `https://docs.google.com/presentation/d/${fileId}/export/pptx`;
-  else                           baseUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
+  let baseUrl, defaultExt;
+  if      (fileType === 'doc')   { baseUrl = `https://docs.google.com/document/d/${fileId}/export/docx`;       defaultExt = 'docx'; }
+  else if (fileType === 'sheet') { baseUrl = `https://docs.google.com/spreadsheets/d/${fileId}/export/xlsx`;   defaultExt = 'xlsx'; }
+  else if (fileType === 'slide') { baseUrl = `https://docs.google.com/presentation/d/${fileId}/export/pptx`;  defaultExt = 'pptx'; }
+  else                           { baseUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;       defaultExt = '';     }
 
-  // Fast URL resolver — only reads headers / small HTML, never downloads the file body
-  const results = await chrome.scripting.executeScript({
+  // Step 1: resolve confirmed URL
+  const urlResult = await chrome.scripting.executeScript({
     target: { tabId }, world: 'MAIN',
     func: async (url) => {
       try {
-        // redirect:'manual' → stops at the 302 instead of crossing into drive.usercontent.google.com
         const r  = await fetch(url, { credentials: 'include', redirect: 'manual' });
-
-        if (r.type === 'opaqueredirect' || r.status === 0) {
-          return { downloadUrl: url }; // let chrome.downloads follow the redirect with its cookies
-        }
-
+        if (r.type === 'opaqueredirect' || r.status === 0) return { downloadUrl: url };
         const ct = r.headers.get('content-type') || '';
         if (!ct.includes('text/html')) {
           const cd  = r.headers.get('content-disposition') || '';
           const fnm = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)/i);
           return { downloadUrl: url, filename: fnm ? decodeURIComponent(fnm[1].trim().replace(/["']/g, '')) : null };
         }
-
-        // Large-file confirmation page — extract token
         const html   = await r.text();
         const cMatch = html.match(/confirm=([^&"'>\s]+)/);
         const uMatch = html.match(/uuid=([^&"'>\s]+)/);
-        if (!cMatch) return { error: 'Download blocked. The file owner may have disabled downloads, or you are not logged into Google.' };
-
+        if (!cMatch) return { error: 'Download blocked — the file owner may have disabled downloads.' };
         return { downloadUrl: `${url}&confirm=${cMatch[1]}${uMatch ? '&uuid=' + uMatch[1] : ''}` };
-      } catch (e) {
-        return { error: e.message };
-      }
+      } catch (e) { return { error: e.message }; }
     },
     args: [baseUrl]
   });
 
-  const info = results[0]?.result;
-  if (!info)             return { ok: false, error: 'Could not run script. Make sure you are on a Google Drive page.' };
-  if (info.error)        return { ok: false, error: info.error };
-  if (!info.downloadUrl) return { ok: false, error: 'Could not resolve download URL.' };
+  const urlInfo = urlResult[0]?.result;
+  if (!urlInfo)            return { ok: false, error: 'Could not run script. Make sure you are on a Google Drive page.' };
+  if (urlInfo.error)       return { ok: false, error: urlInfo.error };
+  if (!urlInfo.downloadUrl) return { ok: false, error: 'Could not resolve download URL.' };
 
-  // chrome.downloads uses Chrome's own cookie jar — handles CDN redirect natively
+  const confirmedUrl = urlInfo.downloadUrl;
+  const filename     = (urlInfo.filename || fileId + (defaultExt ? '.' + defaultExt : '')).replace(/[\\/*?:"<>|]/g, '_');
+
+  // Step 2: inject parallel downloader — fires and returns immediately
+  await chrome.scripting.executeScript({
+    target: { tabId }, world: 'MAIN',
+    func: (dlUrl, fname) => {
+      window.__dl_status = { running: true, progress: 0, message: 'Connecting…', error: null, done: false };
+      const setS = (msg, pct) => { window.__dl_status.message = msg; window.__dl_status.progress = Math.round(pct); };
+
+      // IIFE is NOT awaited — returns immediately so executeScript doesn't block
+      void (async () => {
+        try {
+          setS('Getting download URL…', 3);
+
+          // Follow redirect to get final CDN URL + content-length
+          // drive.usercontent.google.com allows CORS from Google's own origins
+          let cdnUrl = dlUrl, size = 0;
+          try {
+            const h = await fetch(dlUrl, { credentials: 'include', redirect: 'follow', method: 'HEAD' });
+            cdnUrl = h.url && h.url !== dlUrl ? h.url : dlUrl;
+            size   = parseInt(h.headers.get('content-length') || '0');
+          } catch (_) {
+            // CORS blocked on redirect — fall back to chrome.downloads
+            window.__dl_status.error = '__USE_SYSTEM_DL__';
+            return;
+          }
+
+          if (!size) {
+            // No content-length — can't do chunked; fall back
+            window.__dl_status.error = '__USE_SYSTEM_DL__';
+            return;
+          }
+
+          // 8-thread parallel chunk download (same as DriveLoad server)
+          const THREADS   = 8;
+          const chunkSize = Math.ceil(size / THREADS);
+          setS('Downloading… 0%', 5);
+
+          const chunks = new Array(THREADS);
+          let received  = 0;
+
+          await Promise.all(Array.from({ length: THREADS }, async (_, i) => {
+            const start = i * chunkSize;
+            const end   = Math.min(start + chunkSize - 1, size - 1);
+            const r     = await fetch(cdnUrl, {
+              credentials: 'include',
+              headers: { Range: `bytes=${start}-${end}` }
+            });
+            if (!r.ok && r.status !== 206) throw new Error('Range request failed: ' + r.status);
+            const buf   = await r.arrayBuffer();
+            chunks[i]   = buf;
+            received   += buf.byteLength;
+            setS(`Downloading… ${Math.round(received / size * 100)}%`, 5 + (received / size * 90));
+          }));
+
+          setS('Saving…', 97);
+          const blob = new Blob(chunks);
+          const burl = URL.createObjectURL(blob);
+          const a    = Object.assign(document.createElement('a'), { href: burl, download: fname });
+          document.body.appendChild(a); a.click(); document.body.removeChild(a);
+          setTimeout(() => URL.revokeObjectURL(burl), 120_000);
+
+          window.__dl_status = { done: true, progress: 100, message: `Saved: ${fname}`, filename: fname };
+        } catch (e) {
+          // Any fetch failure → fall back to chrome.downloads
+          window.__dl_status.error = '__USE_SYSTEM_DL__';
+        }
+      })();
+    },
+    args: [confirmedUrl, filename]
+  });
+
+  return { ok: true, confirmedUrl, filename };
+}
+
+// ── 3. chrome.downloads fallback (when parallel CORS fails) ───────────────────
+async function systemDownload(url, filename) {
   return new Promise(resolve => {
-    const opts = { url: info.downloadUrl, saveAs: false };
-    if (info.filename) opts.filename = info.filename.replace(/[\\/*?:"<>|]/g, '_');
+    const opts = { url, saveAs: false };
+    if (filename) opts.filename = filename;
     chrome.downloads.download(opts, id => {
       if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
       else resolve({ ok: true });
@@ -121,7 +182,7 @@ async function handleFile(fileId, fileType, tabId) {
   });
 }
 
-// ── 3. PDF canvas capture ─────────────────────────────────────────────────────
+// ── 4. PDF canvas capture ─────────────────────────────────────────────────────
 async function handlePDFCapture(tabId) {
   await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', files: ['vendor/jspdf.min.js'] });
   await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: () => { window.__driveload_status = null; } });
@@ -129,7 +190,7 @@ async function handlePDFCapture(tabId) {
   return { ok: true };
 }
 
-// ── 4. Poll video/file download progress ─────────────────────────────────────
+// ── 5. Poll file download progress ────────────────────────────────────────────
 async function pollDownload(tabId) {
   const results = await chrome.scripting.executeScript({
     target: { tabId }, world: 'MAIN',
@@ -138,7 +199,7 @@ async function pollDownload(tabId) {
   return { status: results[0]?.result || null };
 }
 
-// ── 5. Poll PDF capture progress ──────────────────────────────────────────────
+// ── 6. Poll PDF capture progress ──────────────────────────────────────────────
 async function pollPDF(tabId) {
   const results = await chrome.scripting.executeScript({
     target: { tabId }, world: 'MAIN',
