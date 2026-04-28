@@ -1,11 +1,9 @@
 // DriveLoad Popup
 
-let currentTab      = null;
-let fileId          = null;
-let fileType        = null;
-let polling         = null;
-let confirmedUrl    = null;
-let downloadFilename= null;
+let currentTab = null;
+let fileId     = null;
+let fileType   = null;
+let polling    = null;
 
 const viewNone      = document.getElementById('view-none');
 const viewMain      = document.getElementById('view-main');
@@ -104,15 +102,11 @@ async function startDownload() {
     return;
   }
 
-  // Save for potential fallback
-  confirmedUrl     = res.confirmedUrl;
-  downloadFilename = res.filename;
-
-  // Poll the in-page parallel downloader
+  // SW handles parallel download — poll __dl_status for progress
   pollFileDownload();
 }
 
-// ── Poll in-page download + handle chrome.downloads fallback ─────────────────
+// ── Poll in-page download progress ───────────────────────────────────────────
 function pollFileDownload() {
   clearInterval(polling);
   polling = setInterval(async () => {
@@ -120,31 +114,14 @@ function pollFileDownload() {
     const st     = result?.status;
     if (!st) return;
 
-    if (st.error === '__USE_SYSTEM_DL__') {
-      // Parallel CORS failed → fall back to chrome.downloads silently
-      clearInterval(polling);
-      showProgress('Using standard download…', 80);
-      const fb = await chrome.runtime.sendMessage({
-        action: 'systemDownload', url: confirmedUrl, filename: downloadFilename
-      }).catch(() => null);
-      hideProgress();
-      if (fb?.ok) showSuccess('Download started! Check the browser download bar.');
-      else         showError(fb?.error || 'Download failed.');
-      setWorking(false);
-      return;
-    }
+    if (st.message) showProgress(st.message, st.progress || 0);
 
     if (st.error) {
       clearInterval(polling);
       hideProgress();
       showError(st.error);
       setWorking(false);
-      return;
-    }
-
-    if (st.message) showProgress(st.message, st.progress || 0);
-
-    if (st.done) {
+    } else if (st.done) {
       clearInterval(polling);
       hideProgress();
       showSuccess(st.filename ? `Saved: ${st.filename}` : 'Download complete!');
