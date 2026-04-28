@@ -1,4 +1,4 @@
-// DriveLoad Popup — clean reliable version
+// DriveLoad Popup
 
 let currentTab = null;
 let fileId     = null;
@@ -22,7 +22,6 @@ const errorCard     = document.getElementById('error-card');
 const errorSub      = document.getElementById('error-sub');
 const pdfHint       = document.getElementById('pdf-hint');
 
-// ── Button listeners ──────────────────────────────────────────────────────────
 document.getElementById('btn-download').addEventListener('click', startDownload);
 document.getElementById('btn-pdf-capture').addEventListener('click', startPDFCapture);
 
@@ -34,7 +33,6 @@ document.getElementById('btn-pdf-capture').addEventListener('click', startPDFCap
 
   fileId   = extractFileId(tab.url || '');
   fileType = detectFileType(tab.url || '');
-
   if (!fileId || !fileType) { show(viewNone); return; }
 
   show(viewMain);
@@ -42,7 +40,6 @@ document.getElementById('btn-pdf-capture').addEventListener('click', startPDFCap
   fileIcon.textContent   = meta.icon;
   fileTypeEl.textContent = meta.label;
   btnLabel.textContent   = meta.btnText;
-
   if (fileType === 'file') { show(btnPDFCapture); show(pdfHint); }
 
   fileName.textContent = (tab.title || '')
@@ -79,36 +76,46 @@ async function startDownload() {
   resetResult();
   setWorking(true);
 
+  // For Drive files: try video stream first (quick check)
   if (fileType === 'file') {
-    // Try video stream first
-    showProgress('Checking for video stream…', 15);
+    showProgress('Checking for video stream…', 10);
     const vRes = await chrome.runtime.sendMessage({ action: 'downloadVideo', fileId, tabId: currentTab.id });
-
     if (vRes?.ok) {
       hideProgress();
-      showSuccess(`Video download started!\nCheck the browser download bar.`);
+      showSuccess('Video download started!\nCheck the browser download bar.');
       setWorking(false);
       return;
     }
-
-    // Not a video — download as generic file
-    showProgress('Resolving download URL…', 40);
-  } else {
-    showProgress('Resolving download URL…', 40);
   }
 
-  const res = await chrome.runtime.sendMessage({ action: 'downloadFile', fileId, fileType, tabId: currentTab.id });
+  // File / Doc / Sheet / Slide — parallel SW download with live progress
+  showProgress('Connecting…', 5);
+  startProgressPolling();
 
-  hideProgress();
+  // Use callback style (not await) so polling runs concurrently while SW downloads
+  chrome.runtime.sendMessage({ action: 'downloadFile', fileId, fileType, tabId: currentTab.id }, (res) => {
+    clearInterval(polling);
+    if (chrome.runtime.lastError || !res?.ok) {
+      hideProgress();
+      showError((res?.error) || 'Download failed. Make sure you are logged into Google and on a Drive file page.');
+      setWorking(false);
+    } else {
+      hideProgress();
+      showSuccess(res.filename ? `Saved: ${res.filename}` : 'Download complete!\nCheck your Downloads folder or browser bar.');
+      setWorking(false);
+    }
+  });
+}
 
-  if (!res?.ok) {
-    showError(res?.error || 'Download failed. Make sure you are logged into Google and on a Drive file page.');
-    setWorking(false);
-    return;
-  }
-
-  showSuccess('Download started!\nCheck the browser download bar.');
-  setWorking(false);
+// ── Progress polling (reads __dl_status set by SW during download) ─────────────
+function startProgressPolling() {
+  clearInterval(polling);
+  polling = setInterval(async () => {
+    const r  = await chrome.runtime.sendMessage({ action: 'pollDownload', tabId: currentTab.id }).catch(() => null);
+    const st = r?.status;
+    if (!st || !st.message) return;
+    showProgress(st.message, st.progress || 0);
+  }, 500);
 }
 
 // ── PDF canvas capture ────────────────────────────────────────────────────────
@@ -118,7 +125,6 @@ async function startPDFCapture() {
   showProgress('Injecting PDF capture…', 5);
 
   const res = await chrome.runtime.sendMessage({ action: 'injectPDF', tabId: currentTab.id });
-
   if (!res?.ok) {
     hideProgress();
     showError(res?.error || 'Could not inject PDF capture. Make sure the PDF is open in Google Drive viewer.');
@@ -131,20 +137,9 @@ async function startPDFCapture() {
     const r  = await chrome.runtime.sendMessage({ action: 'pollPDF', tabId: currentTab.id }).catch(() => null);
     const st = r?.status;
     if (!st) return;
-
     showProgress(st.message || 'Processing…', st.progress || 0);
-
-    if (st.error) {
-      clearInterval(polling);
-      hideProgress();
-      showError(st.error);
-      setWorking(false);
-    } else if (st.done) {
-      clearInterval(polling);
-      hideProgress();
-      showSuccess('PDF saved! Check your Downloads folder.');
-      setWorking(false);
-    }
+    if (st.error) { clearInterval(polling); hideProgress(); showError(st.error); setWorking(false); }
+    else if (st.done) { clearInterval(polling); hideProgress(); showSuccess('PDF saved! Check your Downloads folder.'); setWorking(false); }
   }, 700);
 }
 
@@ -152,14 +147,8 @@ async function startPDFCapture() {
 function show(el) { el.classList.remove('hidden'); }
 function hide(el) { el.classList.add('hidden'); }
 function setWorking(on) { btnDownload.disabled = on; btnPDFCapture.disabled = on; }
-
-function showProgress(msg, pct) {
-  show(progressSec);
-  progressFill.style.width  = Math.min(100, Math.max(0, pct)) + '%';
-  progressLabel.textContent = msg;
-}
+function showProgress(msg, pct) { show(progressSec); progressFill.style.width = Math.min(100, Math.max(0, pct)) + '%'; progressLabel.textContent = msg; }
 function hideProgress() { hide(progressSec); }
-
 function showSuccess(msg) { hide(errorCard); successSub.textContent = msg; show(successCard); }
 function showError(msg)   { hide(successCard); errorSub.textContent = msg; show(errorCard); }
 function resetResult()    { hide(successCard); hide(errorCard); hideProgress(); }
