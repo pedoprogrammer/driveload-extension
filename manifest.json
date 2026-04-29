@@ -3,7 +3,7 @@
   "name": "DriveLoad",
   "version": "2.0.0",
   "description": "Download view-only Google Drive videos, PDFs, Docs, and files at original quality.",
-  "permissions": ["cookies", "downloads", "activeTab", "scripting", "tabs", "storage"],
+  "permissions": ["cookies", "downloads", "activeTab", "scripting", "tabs", "storage", "notifications"],
   "host_permissions": [
     "https://drive.google.com/*",
     "https://*.google.com/*",
